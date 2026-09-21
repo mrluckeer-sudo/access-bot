@@ -46,7 +46,8 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("Webhook set: %s", settings.webhook_url)
     yield
-    await bot.delete_webhook(drop_pending_updates=False)
+    # Не вызываем delete_webhook: при редеплое старый инстанс
+    # иначе снимает вебхук у нового.
     await bot.session.close()
     await db.close()
 
