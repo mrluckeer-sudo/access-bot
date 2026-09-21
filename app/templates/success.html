@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Спасибо за оплату</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #f0f3f7;
+      --muted: #9aa8b8;
+      --accent: #2aabee;
+      --accent-hover: #1e96d1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(ellipse at 20% 0%, #1a3a4a 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 100%, #1a2a40 0%, transparent 45%),
+        var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .wrap {
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 650;
+      margin: 0 0 12px;
+      letter-spacing: -0.02em;
+    }
+    p {
+      margin: 0 0 28px;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 1.05rem;
+    }
+    .btn {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1.05rem;
+      padding: 14px 28px;
+      border-radius: 12px;
+      transition: background 0.15s ease, transform 0.15s ease;
+    }
+    .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+    .error { color: #f07178; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {% if ok %}
+      <h1>Оплата прошла</h1>
+      <p>Нажмите кнопку ниже — бот сразу выдаст одноразовую ссылку в закрытый чат.</p>
+      <a class="btn" href="{{ telegram_url }}">Перейти в Telegram</a>
+    {% else %}
+      <h1>Не удалось подтвердить оплату</h1>
+      <p class="error">{{ error }}</p>
+    {% endif %}
+  </div>
+</body>
+</html>
