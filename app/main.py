@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import Update
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.bot_handlers import setup_bot_handlers
@@ -53,6 +54,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Access Bot", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
 def _collect_params(data: dict[str, Any]) -> dict[str, str]:
