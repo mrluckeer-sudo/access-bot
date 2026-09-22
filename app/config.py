@@ -3,6 +3,15 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_amount(value: str) -> str:
+    """990 / 990.0 / 990,00 → 990.00"""
+    cleaned = value.strip().replace(",", ".")
+    try:
+        return f"{float(cleaned):.2f}"
+    except ValueError:
+        return cleaned
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -17,7 +26,11 @@ class Settings(BaseSettings):
     robokassa_password2: str
     robokassa_is_test: int = 1
 
+    # Суммы товаров «доступ в чат» через запятую (остальные оплаты → страница курсов)
     access_price: str = "990.00"
+    course_success_url: str = "https://logopedvolgina.ru/success"
+    course_fail_url: str = "https://logopedvolgina.ru/fail"
+
     database_path: str = "./data/bot.db"
 
     welcome_paid_text: str = (
@@ -29,6 +42,14 @@ class Settings(BaseSettings):
         "Если вы оплатили доступ — напишите в поддержку."
     )
     invite_expire_seconds: int = 3600
+
+    @property
+    def access_prices(self) -> set[str]:
+        raw = self.access_price.replace(";", ",")
+        return {normalize_amount(p) for p in raw.split(",") if p.strip()}
+
+    def is_chat_access_payment(self, out_sum: str) -> bool:
+        return normalize_amount(out_sum) in self.access_prices
 
     @property
     def webhook_path(self) -> str:

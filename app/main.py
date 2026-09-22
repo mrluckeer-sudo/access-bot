@@ -100,8 +100,12 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
 
 
 @app.api_route("/success", methods=["GET", "POST"])
-async def payment_success(request: Request) -> HTMLResponse:
-    """SuccessURL: пользователь после оплаты. Показываем кнопку в Telegram."""
+async def payment_success(request: Request):
+    """
+    Единый SuccessURL из Robokassa:
+    - сумма = товар «доступ в чат» → кнопка Telegram;
+    - иначе (курсы и пр.) → редирект на страницу «Спасибо» на Tilda.
+    """
     if request.method == "POST":
         form = await request.form()
         data = _collect_params(dict(form))
@@ -112,47 +116,45 @@ async def payment_success(request: Request) -> HTMLResponse:
     inv_id = data.get("InvId", "")
     signature = data.get("SignatureValue", "")
 
-    error = "Неизвестная ошибка"
-    telegram_url = None
-    ok = False
-
     if not out_sum or not inv_id or not signature:
-        error = "Нет данных об оплате."
-    elif not verify_success_signature(
+        return templates.TemplateResponse(
+            request,
+            "success.html",
+            {"ok": False, "error": "Нет данных об оплате.", "telegram_url": None},
+        )
+
+    if not verify_success_signature(
         out_sum, inv_id, signature, settings.robokassa_password1, data
     ):
-        error = "Подпись платежа не совпала."
+        return templates.TemplateResponse(
+            request,
+            "success.html",
+            {"ok": False, "error": "Подпись платежа не совпала.", "telegram_url": None},
+        )
+
+    # Курсы и прочие товары — обратно на Tilda
+    if not settings.is_chat_access_payment(out_sum):
+        logger.info("Non-chat payment InvId=%s sum=%s → course success page", inv_id, out_sum)
+        return RedirectResponse(settings.course_success_url, status_code=303)
+
+    payment = await db.get_by_inv_id(int(inv_id))
+    if payment:
+        token = payment["access_token"]
     else:
-        payment = await db.get_by_inv_id(int(inv_id))
-        if payment:
-            token = payment["access_token"]
-        else:
-            # SuccessURL иногда приходит раньше ResultURL — создаём токен
-            # по проверенной подписи Success, ResultURL потом просто подтвердит.
-            token = await db.upsert_paid(int(inv_id), out_sum)
+        token = await db.upsert_paid(int(inv_id), out_sum)
 
-        telegram_url = f"https://t.me/{settings.bot_username}?start={token}"
-        ok = True
-
+    telegram_url = f"https://t.me/{settings.bot_username}?start={token}"
     return templates.TemplateResponse(
         request,
         "success.html",
-        {
-            "ok": ok,
-            "error": error,
-            "telegram_url": telegram_url,
-        },
+        {"ok": True, "error": "", "telegram_url": telegram_url},
     )
 
 
 @app.get("/fail")
-async def payment_fail() -> HTMLResponse:
-    return HTMLResponse(
-        "<html><body style='font-family:sans-serif;text-align:center;padding:48px'>"
-        "<h1>Оплата не завершена</h1>"
-        "<p>Попробуйте ещё раз на сайте.</p>"
-        "</body></html>"
-    )
+async def payment_fail() -> RedirectResponse:
+    """FailURL: как у курсов — на страницу fail сайта."""
+    return RedirectResponse(settings.course_fail_url, status_code=303)
 
 
 @app.get("/dev/fake-paid")
