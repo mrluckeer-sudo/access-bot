@@ -99,18 +99,20 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
     return PlainTextResponse(f"OK{inv_id}")
 
 
-@app.api_route("/success", methods=["GET", "POST"])
-async def payment_success(request: Request):
+async def _robokassa_payload(request: Request) -> dict[str, str]:
+    if request.method == "POST":
+        form = await request.form()
+        return _collect_params(dict(form))
+    return _collect_params(dict(request.query_params))
+
+
+async def _handle_payment_success(request: Request):
     """
     Единый SuccessURL из Robokassa:
     - сумма = товар «доступ в чат» → кнопка Telegram;
     - иначе (курсы и пр.) → редирект на страницу «Спасибо» на Tilda.
     """
-    if request.method == "POST":
-        form = await request.form()
-        data = _collect_params(dict(form))
-    else:
-        data = _collect_params(dict(request.query_params))
+    data = await _robokassa_payload(request)
 
     out_sum = data.get("OutSum", "")
     inv_id = data.get("InvId", "")
@@ -132,7 +134,6 @@ async def payment_success(request: Request):
             {"ok": False, "error": "Подпись платежа не совпала.", "telegram_url": None},
         )
 
-    # Курсы и прочие товары — обратно на Tilda
     if not settings.is_chat_access_payment(out_sum):
         logger.info("Non-chat payment InvId=%s sum=%s → course success page", inv_id, out_sum)
         return RedirectResponse(settings.course_success_url, status_code=303)
@@ -151,9 +152,34 @@ async def payment_success(request: Request):
     )
 
 
-@app.get("/fail")
-async def payment_fail() -> RedirectResponse:
-    """FailURL: как у курсов — на страницу fail сайта."""
+@app.api_route("/", methods=["GET", "POST", "HEAD"])
+async def root(request: Request):
+    """
+    На free-тарифе Render иногда встречает первый запрос «экраном пробуждения».
+    Если Success URL указали без /success — всё равно обработаем оплату здесь.
+    """
+    if request.method == "HEAD":
+        return PlainTextResponse("", status_code=200)
+    data = await _robokassa_payload(request)
+    if data.get("OutSum") and data.get("InvId") and data.get("SignatureValue"):
+        return await _handle_payment_success(request)
+    return PlainTextResponse(
+        "Access bot OK. Success URL: "
+        f"{settings.public_base_url.rstrip('/')}/success"
+    )
+
+
+@app.api_route("/success", methods=["GET", "POST", "HEAD"])
+async def payment_success(request: Request):
+    if request.method == "HEAD":
+        return PlainTextResponse("", status_code=200)
+    return await _handle_payment_success(request)
+
+
+@app.api_route("/fail", methods=["GET", "POST", "HEAD"])
+async def payment_fail(request: Request) -> RedirectResponse | PlainTextResponse:
+    if request.method == "HEAD":
+        return PlainTextResponse("", status_code=200)
     return RedirectResponse(settings.course_fail_url, status_code=303)
 
 
