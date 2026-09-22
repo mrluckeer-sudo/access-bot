@@ -178,8 +178,8 @@ async def payment_success(request: Request):
     return await _handle_payment_success(request)
 
 
-@app.api_route("/fail", methods=["GET", "POST", "HEAD"])
-async def payment_fail(request: Request) -> RedirectResponse | PlainTextResponse:
+@app.api_route("/fail", methods=["GET", "POST", "HEAD"], response_model=None)
+async def payment_fail(request: Request):
     if request.method == "HEAD":
         return PlainTextResponse("", status_code=200)
     return RedirectResponse(settings.course_fail_url, status_code=303)
