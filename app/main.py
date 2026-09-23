@@ -79,10 +79,63 @@ async def _robokassa_payload(request: Request) -> dict[str, str]:
     return _collect_params(dict(request.query_params))
 
 
+async def _resolve_chat_email(inv_id: int, data: dict[str, str]) -> str | None:
+    """Email: уже сохранённый → Robokassa → свежая форма Tilda."""
+    existing = await db.get_by_inv_id(inv_id)
+    if existing and existing["email"]:
+        return existing["email"]
+
+    email = _extract_email(data)
+    if email:
+        return email
+
+    lead = await db.claim_pending_lead(
+        product=settings.default_product,
+        inv_id=inv_id,
+        max_age_minutes=settings.lead_match_minutes,
+    )
+    if lead:
+        logger.info(
+            "Matched Tilda lead id=%s email=%s → InvId=%s",
+            lead["id"],
+            lead["email"],
+            inv_id,
+        )
+        return lead["email"]
+    return None
+
+
+def _extract_email_from_tilda(data: dict[str, str]) -> str | None:
+    # Tilda: Email / email / E-mail / переменная поля
+    for key, value in data.items():
+        key_l = key.lower().replace("-", "").replace("_", "")
+        if key_l in {"email", "e-mail", "mail", "почта"} or "email" in key.lower():
+            value = (value or "").strip()
+            if value and _EMAIL_RE.match(value):
+                return value
+    return _extract_email(data)
+
+
+def _extract_name_from_tilda(data: dict[str, str]) -> str | None:
+    for key in ("Name", "name", "Имя", "FIO", "fio"):
+        value = (data.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _extract_product_from_tilda(data: dict[str, str]) -> str:
+    for key in ("product", "Product", "Shp_product", "товар"):
+        value = (data.get(key) or "").strip().lower()
+        if value:
+            return value
+    return settings.default_product
+
+
 async def _ensure_chat_access(inv_id: int, out_sum: str, email: str | None) -> tuple[str, str, bool]:
     """
     Создаёт/обновляет оплату чата, шлёт письмо один раз.
-    Returns: token, telegram_url, email_sent_now_or_earlier
+    Returns: token, telegram_url, email_already_sent_or_just_sent
     """
     token_probe = await db.upsert_paid(inv_id, out_sum, email=email)
     telegram_url = f"https://t.me/{settings.bot_username}?start={token_probe}"
@@ -119,6 +172,55 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.api_route("/tilda/webhook", methods=["POST", "OPTIONS"])
+async def tilda_form_webhook(request: Request) -> PlainTextResponse:
+    """
+    Webhook формы Tilda. Обязательно ответить ровно `ok` за < 7 сек.
+    Настройки: Сайт → Формы → Webhook → этот URL.
+    """
+    if request.method == "OPTIONS":
+        return PlainTextResponse(
+            "ok",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+
+    try:
+        form = await request.form()
+        data = _collect_params(dict(form))
+    except Exception:
+        try:
+            data = _collect_params(await request.json())
+        except Exception:
+            data = {}
+
+    email = _extract_email_from_tilda(data)
+    if not email:
+        logger.warning("Tilda webhook without email keys=%s", list(data.keys()))
+        # Всё равно ok — иначе Tilda покажет ошибку формы
+        return PlainTextResponse(
+            "ok",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    product = _extract_product_from_tilda(data)
+    lead_id = await db.create_pending_lead(
+        email=email,
+        product=product,
+        name=_extract_name_from_tilda(data),
+        formid=data.get("formid") or data.get("formname"),
+        tranid=data.get("tranid"),
+    )
+    logger.info("Tilda lead saved id=%s email=%s product=%s", lead_id, email, product)
+    return PlainTextResponse(
+        "ok",
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
 @app.post(settings.webhook_path)
 async def telegram_webhook(request: Request) -> dict[str, bool]:
     payload = await request.json()
@@ -149,7 +251,7 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
         logger.warning("Invalid ResultURL signature for InvId=%s", inv_id)
         return PlainTextResponse("bad sign", status_code=400)
 
-    email = _extract_email(data)
+    email = await _resolve_chat_email(int(inv_id), data)
 
     if settings.is_chat_access_payment(out_sum):
         token, telegram_url, mailed = await _ensure_chat_access(int(inv_id), out_sum, email)
@@ -206,7 +308,7 @@ async def _handle_payment_success(request: Request):
         logger.info("Non-chat payment InvId=%s sum=%s → course success page", inv_id, out_sum)
         return RedirectResponse(settings.course_success_url, status_code=303)
 
-    email = _extract_email(data)
+    email = await _resolve_chat_email(int(inv_id), data)
     _token, telegram_url, mailed = await _ensure_chat_access(int(inv_id), out_sum, email)
 
     if mailed and email:
@@ -216,7 +318,10 @@ async def _handle_payment_success(request: Request):
     elif email:
         email_note = "Не удалось отправить письмо — используйте кнопку ниже или форму восстановления."
     else:
-        email_note = "Email в данных оплаты не найден. Сохраните ссылку или восстановите доступ по почте с формы."
+        email_note = (
+            "Не нашли email с формы. Сохраните ссылку ниже или напишите в поддержку. "
+            "Проверьте, что webhook формы Tilda включён."
+        )
 
     return templates.TemplateResponse(
         request,

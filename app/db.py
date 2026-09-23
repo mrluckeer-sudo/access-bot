@@ -38,6 +38,20 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_payments_token ON payments(access_token);
             CREATE INDEX IF NOT EXISTS idx_payments_email ON payments(email);
+
+            CREATE TABLE IF NOT EXISTS pending_leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                product TEXT NOT NULL DEFAULT 'chat',
+                name TEXT,
+                formid TEXT,
+                tranid TEXT,
+                created_at TEXT NOT NULL,
+                claimed_at TEXT,
+                claimed_inv_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_leads_open
+                ON pending_leads(product, claimed_at, created_at);
             """
         )
         await self._migrate()
@@ -140,6 +154,73 @@ class Database:
             """,
             (email.strip(),),
         )
+
+    async def create_pending_lead(
+        self,
+        email: str,
+        product: str = "chat",
+        name: str | None = None,
+        formid: str | None = None,
+        tranid: str | None = None,
+    ) -> int:
+        cursor = await self.conn.execute(
+            """
+            INSERT INTO pending_leads (email, product, name, formid, tranid, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (email.strip(), product, name, formid, tranid, utcnow()),
+        )
+        await self.conn.commit()
+        return int(cursor.lastrowid)
+
+    async def claim_pending_lead(
+        self,
+        product: str,
+        inv_id: int,
+        max_age_minutes: int = 60,
+    ) -> aiosqlite.Row | None:
+        """Берёт самый свежий незабранный lead по продукту за окно времени."""
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM pending_leads
+            WHERE product = ? AND claimed_at IS NULL
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (product,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        now = datetime.now(timezone.utc)
+        chosen = None
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            age_min = (now - created).total_seconds() / 60.0
+            if 0 <= age_min <= max_age_minutes:
+                chosen = row
+                break
+
+        if not chosen:
+            return None
+
+        updated = await self.conn.execute(
+            """
+            UPDATE pending_leads
+            SET claimed_at = ?, claimed_inv_id = ?
+            WHERE id = ? AND claimed_at IS NULL
+            """,
+            (utcnow(), inv_id, chosen["id"]),
+        )
+        await self.conn.commit()
+        if updated.rowcount == 0:
+            return None
+        return chosen
 
     async def mark_email_sent(self, inv_id: int) -> None:
         await self.conn.execute(

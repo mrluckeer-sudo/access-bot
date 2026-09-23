@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     )
     invite_expire_seconds: int = 3600
 
+    # Склейка формы Tilda с оплатой
+    lead_match_minutes: int = 60
+    default_product: str = "chat"
+    tilda_webhook_path: str = "/tilda/webhook"
+
     # SMTP (например Яндекс: smtp.yandex.ru, порт 465, SSL)
     smtp_host: str = ""
     smtp_port: int = 465
