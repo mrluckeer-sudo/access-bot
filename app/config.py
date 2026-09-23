@@ -26,10 +26,10 @@ class Settings(BaseSettings):
     robokassa_password2: str
     robokassa_is_test: int = 1
 
-    # Суммы товаров «доступ в чат» через запятую (остальные оплаты → страница курсов)
     access_price: str = "990.00"
     course_success_url: str = "https://logopedvolgina.ru/success"
     course_fail_url: str = "https://logopedvolgina.ru/fail"
+    tilda_result_url: str = "https://forms.tildacdn.com/payment/robokassa/"
 
     database_path: str = "./data/bot.db"
 
@@ -42,6 +42,29 @@ class Settings(BaseSettings):
         "Если вы оплатили доступ — напишите в поддержку."
     )
     invite_expire_seconds: int = 3600
+
+    # SMTP (например Яндекс: smtp.yandex.ru, порт 465, SSL)
+    smtp_host: str = ""
+    smtp_port: int = 465
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_reply_to: str = ""
+    smtp_use_ssl: int = 1
+    smtp_use_starttls: int = 0
+
+    email_subject: str = "Ваша ссылка в Telegram-чат — Volgina"
+    email_body_template: str = (
+        "Здравствуйте!\n\n"
+        "Оплата прошла успешно. Чтобы получить доступ в закрытый чат, "
+        "перейдите по ссылке и нажмите Start у бота:\n\n"
+        "{telegram_url}\n\n"
+        "Если кнопка «Вернуться в магазин» на Robokassa вас смутила — "
+        "этого письма достаточно, оплата уже учтена.\n\n"
+        "С уважением,\nVolgina"
+    )
+    # Через сколько секунд автоматически открыть Telegram на success-странице (0 = выкл)
+    auto_open_telegram_seconds: int = 4
 
     @property
     def access_prices(self) -> set[str]:

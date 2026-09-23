@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Восстановить доступ — Volgina</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Lora:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f6f6ee;
+      --text: #413f3d;
+      --btn-bg: #e8e6d2;
+      --btn-border: #413f3d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Lora", Georgia, serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+    }
+    .wrap { max-width: 440px; width: 100%; text-align: center; }
+    .logo {
+      display: block;
+      width: min(280px, 80%);
+      height: auto;
+      margin: 0 auto 36px;
+    }
+    h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 14px; }
+    p { line-height: 1.5; margin: 0 0 20px; opacity: 0.92; }
+    label { display: block; text-align: left; margin-bottom: 6px; font-size: 0.95rem; }
+    input[type="email"] {
+      width: 100%;
+      padding: 12px 14px;
+      border: 3px solid var(--btn-border);
+      background: #fff;
+      font-family: inherit;
+      font-size: 1rem;
+      color: var(--text);
+      margin-bottom: 18px;
+    }
+    button, .btn {
+      display: inline-block;
+      background: var(--btn-bg);
+      color: var(--text);
+      text-decoration: none;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 1.05rem;
+      padding: 14px 28px;
+      border: 3px solid var(--btn-border);
+      cursor: pointer;
+    }
+    .msg { margin-top: 18px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <img class="logo" src="/static/logo.png" alt="Volgina" width="280" height="80" />
+    <h1>Восстановить доступ</h1>
+    <p>Введите email, который указывали в форме перед оплатой.</p>
+    <form method="post" action="/recover">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required autocomplete="email" />
+      <button type="submit">Найти ссылку</button>
+    </form>
+    {% if ok == true %}
+      <p class="msg">{{ message }}</p>
+      <a class="btn" href="{{ telegram_url }}">Перейти в Telegram</a>
+    {% elif ok == false %}
+      <p class="msg">{{ message }}</p>
+    {% endif %}
+  </div>
+</body>
+</html>

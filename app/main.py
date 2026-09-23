@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import Update
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.bot_handlers import setup_bot_handlers
 from app.config import get_settings
 from app.db import Database
+from app.email_sender import send_access_email, smtp_configured
 from app.robokassa import (
     payment_signature,
     verify_result_signature,
@@ -35,6 +38,8 @@ bot = Bot(
 dp = Dispatcher()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -47,8 +52,6 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("Webhook set: %s", settings.webhook_url)
     yield
-    # Не вызываем delete_webhook: при редеплое старый инстанс
-    # иначе снимает вебхук у нового.
     await bot.session.close()
     await db.close()
 
@@ -59,6 +62,56 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 
 def _collect_params(data: dict[str, Any]) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items() if v is not None}
+
+
+def _extract_email(data: dict[str, str]) -> str | None:
+    for key in ("EMail", "Email", "email", "Shp_email", "Shp_Email", "shp_email"):
+        value = (data.get(key) or "").strip()
+        if value and _EMAIL_RE.match(value):
+            return value
+    return None
+
+
+async def _robokassa_payload(request: Request) -> dict[str, str]:
+    if request.method == "POST":
+        form = await request.form()
+        return _collect_params(dict(form))
+    return _collect_params(dict(request.query_params))
+
+
+async def _ensure_chat_access(inv_id: int, out_sum: str, email: str | None) -> tuple[str, str, bool]:
+    """
+    Создаёт/обновляет оплату чата, шлёт письмо один раз.
+    Returns: token, telegram_url, email_sent_now_or_earlier
+    """
+    token_probe = await db.upsert_paid(inv_id, out_sum, email=email)
+    telegram_url = f"https://t.me/{settings.bot_username}?start={token_probe}"
+    token = await db.upsert_paid(inv_id, out_sum, email=email, telegram_url=telegram_url)
+
+    payment = await db.get_by_inv_id(inv_id)
+    already_sent = bool(payment and payment["email_sent_at"])
+    mail = email or (payment["email"] if payment else None)
+
+    if mail and not already_sent:
+        sent = await send_access_email(settings, mail, telegram_url)
+        if sent:
+            await db.mark_email_sent(inv_id)
+            already_sent = True
+
+    return token, telegram_url, already_sent
+
+
+async def _forward_result_to_tilda(data: dict[str, str]) -> None:
+    """Чтобы курсы на Tilda продолжали отмечаться оплаченными."""
+    url = settings.tilda_result_url
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url, data=data)
+            logger.info("Forwarded Result to Tilda status=%s body=%s", resp.status_code, resp.text[:120])
+    except Exception:
+        logger.exception("Failed to forward ResultURL to Tilda")
 
 
 @app.get("/health")
@@ -76,12 +129,12 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
 
 @app.api_route("/robokassa/result", methods=["GET", "POST"])
 async def robokassa_result(request: Request) -> PlainTextResponse:
-    """ResultURL: серверное уведомление от Robokassa. Ответ должен быть OK{InvId}."""
-    if request.method == "POST":
-        form = await request.form()
-        data = _collect_params(dict(form))
-    else:
-        data = _collect_params(dict(request.query_params))
+    """
+    ResultURL (поставьте его в Robokassa вместо Tilda).
+    — для чата: токен + письмо (даже если человек не нажал «вернуться в магазин»);
+    — всем: проксируем уведомление на Tilda, чтобы курсы не сломались.
+    """
+    data = await _robokassa_payload(request)
 
     out_sum = data.get("OutSum", "")
     inv_id = data.get("InvId", "")
@@ -96,24 +149,25 @@ async def robokassa_result(request: Request) -> PlainTextResponse:
         logger.warning("Invalid ResultURL signature for InvId=%s", inv_id)
         return PlainTextResponse("bad sign", status_code=400)
 
-    token = await db.upsert_paid(int(inv_id), out_sum)
-    logger.info("Payment confirmed InvId=%s token=%s…", inv_id, token[:8])
+    email = _extract_email(data)
+
+    if settings.is_chat_access_payment(out_sum):
+        token, telegram_url, mailed = await _ensure_chat_access(int(inv_id), out_sum, email)
+        logger.info(
+            "Chat payment Result InvId=%s token=%s… email=%s mailed=%s",
+            inv_id,
+            token[:8],
+            email,
+            mailed,
+        )
+    else:
+        logger.info("Course/other payment Result InvId=%s sum=%s", inv_id, out_sum)
+
+    await _forward_result_to_tilda(data)
     return PlainTextResponse(f"OK{inv_id}")
 
 
-async def _robokassa_payload(request: Request) -> dict[str, str]:
-    if request.method == "POST":
-        form = await request.form()
-        return _collect_params(dict(form))
-    return _collect_params(dict(request.query_params))
-
-
 async def _handle_payment_success(request: Request):
-    """
-    Единый SuccessURL из Robokassa:
-    - сумма = товар «доступ в чат» → кнопка Telegram;
-    - иначе (курсы и пр.) → редирект на страницу «Спасибо» на Tilda.
-    """
     data = await _robokassa_payload(request)
 
     out_sum = data.get("OutSum", "")
@@ -124,7 +178,13 @@ async def _handle_payment_success(request: Request):
         return templates.TemplateResponse(
             request,
             "success.html",
-            {"ok": False, "error": "Нет данных об оплате.", "telegram_url": None},
+            {
+                "ok": False,
+                "error": "Нет данных об оплате.",
+                "telegram_url": None,
+                "email_note": None,
+                "auto_open_seconds": 0,
+            },
         )
 
     if not verify_success_signature(
@@ -133,33 +193,46 @@ async def _handle_payment_success(request: Request):
         return templates.TemplateResponse(
             request,
             "success.html",
-            {"ok": False, "error": "Подпись платежа не совпала.", "telegram_url": None},
+            {
+                "ok": False,
+                "error": "Подпись платежа не совпала.",
+                "telegram_url": None,
+                "email_note": None,
+                "auto_open_seconds": 0,
+            },
         )
 
     if not settings.is_chat_access_payment(out_sum):
         logger.info("Non-chat payment InvId=%s sum=%s → course success page", inv_id, out_sum)
         return RedirectResponse(settings.course_success_url, status_code=303)
 
-    payment = await db.get_by_inv_id(int(inv_id))
-    if payment:
-        token = payment["access_token"]
-    else:
-        token = await db.upsert_paid(int(inv_id), out_sum)
+    email = _extract_email(data)
+    _token, telegram_url, mailed = await _ensure_chat_access(int(inv_id), out_sum, email)
 
-    telegram_url = f"https://t.me/{settings.bot_username}?start={token}"
+    if mailed and email:
+        email_note = f"Дублируем ссылку на почту {email} — если закроете страницу, письмо останется."
+    elif email and not smtp_configured(settings):
+        email_note = "Почта получена, но SMTP ещё не настроен — письмо не отправлено."
+    elif email:
+        email_note = "Не удалось отправить письмо — используйте кнопку ниже или форму восстановления."
+    else:
+        email_note = "Email в данных оплаты не найден. Сохраните ссылку или восстановите доступ по почте с формы."
+
     return templates.TemplateResponse(
         request,
         "success.html",
-        {"ok": True, "error": "", "telegram_url": telegram_url},
+        {
+            "ok": True,
+            "error": "",
+            "telegram_url": telegram_url,
+            "email_note": email_note,
+            "auto_open_seconds": settings.auto_open_telegram_seconds,
+        },
     )
 
 
 @app.api_route("/", methods=["GET", "POST", "HEAD"])
 async def root(request: Request):
-    """
-    На free-тарифе Render иногда встречает первый запрос «экраном пробуждения».
-    Если Success URL указали без /success — всё равно обработаем оплату здесь.
-    """
     if request.method == "HEAD":
         return PlainTextResponse("", status_code=200)
     data = await _robokassa_payload(request)
@@ -185,19 +258,64 @@ async def payment_fail(request: Request):
     return RedirectResponse(settings.course_fail_url, status_code=303)
 
 
+@app.api_route("/recover", methods=["GET", "POST"], response_model=None)
+async def recover_access(request: Request, email: str | None = Form(None)):
+    """Повторно показать ссылку по email с формы (если токен ещё не использован)."""
+    if request.method == "GET":
+        return templates.TemplateResponse(
+            request,
+            "recover.html",
+            {"ok": None, "telegram_url": None, "message": None},
+        )
+
+    mail = (email or "").strip()
+    if not mail or not _EMAIL_RE.match(mail):
+        return templates.TemplateResponse(
+            request,
+            "recover.html",
+            {"ok": False, "telegram_url": None, "message": "Введите корректный email."},
+        )
+
+    payment = await db.get_latest_unused_by_email(mail)
+    if not payment:
+        return templates.TemplateResponse(
+            request,
+            "recover.html",
+            {
+                "ok": False,
+                "telegram_url": None,
+                "message": "Активная ссылка для этого email не найдена. Напишите в поддержку.",
+            },
+        )
+
+    telegram_url = payment["telegram_url"] or (
+        f"https://t.me/{settings.bot_username}?start={payment['access_token']}"
+    )
+    return templates.TemplateResponse(
+        request,
+        "recover.html",
+        {
+            "ok": True,
+            "telegram_url": telegram_url,
+            "message": "Нашли вашу ссылку. Перейдите в Telegram:",
+        },
+    )
+
+
 @app.get("/dev/fake-paid")
-async def fake_paid(inv_id: int = Query(..., ge=1)) -> RedirectResponse:
-    """Тест без Robokassa (только при ROBOKASSA_IS_TEST=1)."""
+async def fake_paid(
+    inv_id: int = Query(..., ge=1),
+    email: str | None = Query(None),
+) -> RedirectResponse:
     if settings.robokassa_is_test != 1:
         raise HTTPException(403, "Disabled outside test mode")
-    token = await db.upsert_paid(inv_id, settings.access_price)
-    url = f"https://t.me/{settings.bot_username}?start={token}"
+    mail = email if email and _EMAIL_RE.match(email) else None
+    _token, url, _mailed = await _ensure_chat_access(inv_id, settings.access_price, mail)
     return RedirectResponse(url)
 
 
 @app.get("/dev/pay-link")
 async def pay_link(inv_id: int = Query(..., ge=1)) -> dict[str, str]:
-    """Тестовая ссылка на оплату Robokassa."""
     if settings.robokassa_is_test != 1:
         raise HTTPException(403, "Disabled outside test mode")
     out_sum = settings.access_price
