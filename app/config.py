@@ -59,7 +59,10 @@ class Settings(BaseSettings):
     smtp_use_ssl: int = 1
     smtp_use_starttls: int = 0
 
-    # Unisender Go (HTTPS) — рекомендуется на Render Free
+    # Brevo (HTTPS) — рекомендуется: без DNS, подтверждение sender кодом
+    brevo_api_key: str = ""
+
+    # Unisender Go (нужен домен ссылок NS/CNAME — на Tilda DNS обычно нельзя)
     unisender_go_api_key: str = ""
     unisender_go_base_url: str = "https://goapi.unisender.ru/ru/transactional/api/v1"
 

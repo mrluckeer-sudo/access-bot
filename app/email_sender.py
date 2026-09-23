@@ -1,4 +1,4 @@
-"""Отправка писем: Unisender Go / Resend (HTTPS) или SMTP."""
+"""Отправка писем: Brevo / Unisender / Resend (HTTPS) или SMTP."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ def resend_configured(settings: Settings) -> bool:
     return bool(settings.resend_api_key and settings.smtp_from)
 
 
+def brevo_configured(settings: Settings) -> bool:
+    return bool(settings.brevo_api_key and settings.smtp_from)
+
+
 def unisender_go_configured(settings: Settings) -> bool:
     return bool(settings.unisender_go_api_key and settings.smtp_from)
 
@@ -33,7 +37,8 @@ def unisender_classic_configured(settings: Settings) -> bool:
 
 def email_configured(settings: Settings) -> bool:
     return (
-        unisender_go_configured(settings)
+        brevo_configured(settings)
+        or unisender_go_configured(settings)
         or unisender_classic_configured(settings)
         or resend_configured(settings)
         or smtp_configured(settings)
@@ -63,6 +68,34 @@ def _send_smtp_sync(settings: Settings, to_email: str, subject: str, body: str) 
                 smtp.ehlo()
             smtp.login(settings.smtp_user, settings.smtp_password)
             smtp.send_message(msg)
+
+
+async def _send_brevo(settings: Settings, to_email: str, subject: str, body: str) -> None:
+    payload: dict = {
+        "sender": {
+            "email": settings.smtp_from,
+            "name": settings.smtp_from_name or "Volgina",
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body,
+        "htmlContent": body.replace("\n", "<br>\n"),
+    }
+    if settings.smtp_reply_to:
+        payload["replyTo"] = {"email": settings.smtp_reply_to}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "api-key": settings.brevo_api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Brevo HTTP {resp.status_code}: {resp.text[:400]}")
 
 
 async def _send_resend(settings: Settings, to_email: str, subject: str, body: str) -> None:
@@ -117,7 +150,6 @@ async def _send_unisender_go(settings: Settings, to_email: str, subject: str, bo
         if resp.status_code >= 400:
             raise RuntimeError(f"Unisender Go HTTP {resp.status_code}: {resp.text[:400]}")
         data = resp.json()
-        # типичный ответ: {"status":"success", ...} или ошибка в теле
         if isinstance(data, dict) and data.get("status") == "error":
             raise RuntimeError(f"Unisender Go error: {data}")
 
@@ -155,7 +187,9 @@ async def send_access_email(settings: Settings, to_email: str, telegram_url: str
     subject = settings.email_subject
     body = settings.email_body_template.format(telegram_url=telegram_url)
     try:
-        if unisender_go_configured(settings):
+        if brevo_configured(settings):
+            await _send_brevo(settings, to_email, subject, body)
+        elif unisender_go_configured(settings):
             await _send_unisender_go(settings, to_email, subject, body)
         elif unisender_classic_configured(settings):
             await _send_unisender_classic(settings, to_email, subject, body)

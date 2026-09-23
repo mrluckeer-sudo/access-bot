@@ -333,7 +333,7 @@ async def _handle_payment_success(request: Request, background: BackgroundTasks)
     if mailed and mail:
         email_note = f"Ссылку дублируем на почту {mail}."
     elif mail and not email_configured(settings):
-        email_note = "Почта есть, но отправка писем ещё не настроена (нужен Unisender Go API на Render)."
+        email_note = "Почта есть, но отправка писем ещё не настроена (нужен Brevo API на Render)."
     elif mail:
         email_note = "Письмо могло не отправиться — сохраните кнопку/ссылку ниже."
     else:
