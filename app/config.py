@@ -54,11 +54,20 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+    smtp_from_name: str = "Volgina"
     smtp_reply_to: str = ""
     smtp_use_ssl: int = 1
     smtp_use_starttls: int = 0
 
-    # Resend.com API (HTTPS) — предпочтительно на Render Free (SMTP там блокируют)
+    # Unisender Go (HTTPS) — рекомендуется на Render Free
+    unisender_go_api_key: str = ""
+    unisender_go_base_url: str = "https://goapi.unisender.ru/ru/transactional/api/v1"
+
+    # Классический Unisender.com (нужен list_id)
+    unisender_api_key: str = ""
+    unisender_list_id: str = ""
+
+    # Resend.com API (HTTPS) — нужен CNAME в DNS (на Tilda DNS нельзя)
     resend_api_key: str = ""
 
     email_subject: str = "Ваша ссылка в Telegram-чат — Volgina"
