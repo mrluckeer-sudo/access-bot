@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     smtp_use_ssl: int = 1
     smtp_use_starttls: int = 0
 
+    # Resend.com API (HTTPS) — предпочтительно на Render Free (SMTP там блокируют)
+    resend_api_key: str = ""
+
     email_subject: str = "Ваша ссылка в Telegram-чат — Volgina"
     email_body_template: str = (
         "Здравствуйте!\n\n"
