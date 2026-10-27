@@ -5,6 +5,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
 
 import httpx
 from aiogram import Bot, Dispatcher
@@ -12,12 +13,17 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import Update
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.bot_handlers import setup_bot_handlers
-from app.config import get_settings
+from app.cloudpayments import (
+    parse_data_json,
+    resolve_inv_id,
+    verify_notification_hmac,
+)
+from app.config import get_settings, normalize_amount
 from app.db import Database
 from app.email_sender import email_configured, send_access_email
 from app.robokassa import (
@@ -25,6 +31,7 @@ from app.robokassa import (
     verify_result_signature,
     verify_success_signature,
 )
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -64,22 +71,42 @@ def _collect_params(data: dict[str, Any]) -> dict[str, str]:
 
 
 def _extract_email(data: dict[str, str]) -> str | None:
-    for key in ("EMail", "Email", "email", "Shp_email", "Shp_Email", "shp_email"):
+    for key in ("EMail", "Email", "email", "Shp_email", "Shp_Email", "shp_email", "AccountId"):
         value = (data.get(key) or "").strip()
+        if value and _EMAIL_RE.match(value):
+            return value
+    # CloudPayments Data JSON
+    extra = parse_data_json(data.get("Data"))
+    for key in ("email", "Email", "EMail"):
+        value = str(extra.get(key) or "").strip()
         if value and _EMAIL_RE.match(value):
             return value
     return None
 
 
-async def _robokassa_payload(request: Request) -> dict[str, str]:
+async def _form_payload(request: Request) -> dict[str, str]:
     if request.method == "POST":
         form = await request.form()
         return _collect_params(dict(form))
     return _collect_params(dict(request.query_params))
 
 
+async def _raw_form_and_verify_cp(request: Request) -> tuple[dict[str, str], bool]:
+    """Читает raw body для HMAC CloudPayments, затем парсит form-поля."""
+    raw_body = await request.body()
+    signature = request.headers.get("Content-HMAC") or request.headers.get("X-Content-HMAC")
+    ok = True
+    if settings.cloudpayments_configured:
+        ok = verify_notification_hmac(raw_body, signature, settings.cloudpayments_api_secret)
+    try:
+        data = dict(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True))
+    except Exception:
+        data = {}
+    return data, ok
+
+
 async def _resolve_chat_email(inv_id: int, data: dict[str, str]) -> str | None:
-    """Email: уже сохранённый → Robokassa → свежая форма Tilda."""
+    """Email: уже сохранённый → уведомление → свежая форма Tilda."""
     existing = await db.get_by_inv_id(inv_id)
     if existing and existing["email"]:
         return existing["email"]
@@ -105,7 +132,6 @@ async def _resolve_chat_email(inv_id: int, data: dict[str, str]) -> str | None:
 
 
 def _extract_email_from_tilda(data: dict[str, str]) -> str | None:
-    # Tilda: Email / email / E-mail / переменная поля
     for key, value in data.items():
         key_l = key.lower().replace("-", "").replace("_", "")
         if key_l in {"email", "e-mail", "mail", "почта"} or "email" in key.lower():
@@ -169,17 +195,21 @@ async def _ensure_chat_access(
     return token, telegram_url, already_sent or will_send, mail
 
 
-async def _forward_result_to_tilda(data: dict[str, str]) -> None:
-    """Чтобы курсы на Tilda продолжали отмечаться оплаченными."""
-    url = settings.tilda_result_url
+async def _forward_form(url: str, data: dict[str, str], label: str) -> None:
     if not url:
         return
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(url, data=data)
-            logger.info("Forwarded Result to Tilda status=%s body=%s", resp.status_code, resp.text[:120])
+            logger.info(
+                "Forwarded %s to %s status=%s body=%s",
+                label,
+                url,
+                resp.status_code,
+                resp.text[:120],
+            )
     except Exception:
-        logger.exception("Failed to forward ResultURL to Tilda")
+        logger.exception("Failed to forward %s to %s", label, url)
 
 
 @app.get("/health")
@@ -215,7 +245,6 @@ async def tilda_form_webhook(request: Request) -> PlainTextResponse:
     email = _extract_email_from_tilda(data)
     if not email:
         logger.warning("Tilda webhook without email keys=%s", list(data.keys()))
-        # Всё равно ok — иначе Tilda покажет ошибку формы
         return PlainTextResponse(
             "ok",
             headers={"Access-Control-Allow-Origin": "*"},
@@ -244,51 +273,126 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
-@app.api_route("/robokassa/result", methods=["GET", "POST"])
-async def robokassa_result(request: Request, background: BackgroundTasks) -> PlainTextResponse:
+# --- CloudPayments -----------------------------------------------------------
+
+
+@app.post("/cloudpayments/check")
+async def cloudpayments_check(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Check-уведомление: одобряем оплату и проксируем на Tilda."""
+    data, ok = await _raw_form_and_verify_cp(request)
+    if not ok:
+        logger.warning("Invalid CloudPayments Check HMAC")
+        return JSONResponse({"code": 13}, status_code=200)
+
+    background.add_task(_forward_form, settings.tilda_cp_check_url, data, "Check")
+    return JSONResponse({"code": 0})
+
+
+@app.post("/cloudpayments/pay")
+async def cloudpayments_pay(request: Request, background: BackgroundTasks) -> JSONResponse:
     """
-    ResultURL (поставьте его в Robokassa вместо Tilda).
-    — для чата: токен + письмо (даже если человек не нажал «вернуться в магазин»);
-    — всем: проксируем уведомление на Tilda, чтобы курсы не сломались.
+    Pay-уведомление (аналог ResultURL):
+    — для чата: токен + письмо;
+    — всем: проксируем на Tilda pay, чтобы курсы не сломались.
     """
-    data = await _robokassa_payload(request)
+    data, ok = await _raw_form_and_verify_cp(request)
+    if not ok:
+        logger.warning("Invalid CloudPayments Pay HMAC TransactionId=%s", data.get("TransactionId"))
+        return JSONResponse({"code": 13}, status_code=200)
 
-    out_sum = data.get("OutSum", "")
-    inv_id = data.get("InvId", "")
-    signature = data.get("SignatureValue", "")
+    amount = normalize_amount(data.get("Amount") or "")
+    inv_id = resolve_inv_id(data.get("InvoiceId"), data.get("TransactionId"))
+    if inv_id is None:
+        logger.warning("CloudPayments Pay without numeric InvoiceId/TransactionId: %s", data)
+        background.add_task(_forward_form, settings.tilda_cp_pay_url, data, "Pay")
+        return JSONResponse({"code": 0})
 
-    if not out_sum or not inv_id or not signature:
-        return PlainTextResponse("bad request", status_code=400)
+    email = await _resolve_chat_email(inv_id, data)
 
-    if not verify_result_signature(
-        out_sum, inv_id, signature, settings.robokassa_password2, data
-    ):
-        logger.warning("Invalid ResultURL signature for InvId=%s", inv_id)
-        return PlainTextResponse("bad sign", status_code=400)
-
-    email = await _resolve_chat_email(int(inv_id), data)
-
-    if settings.is_chat_access_payment(out_sum):
+    if settings.is_chat_access_payment(amount):
         token, _telegram_url, mailed, mail = await _ensure_chat_access(
-            int(inv_id), out_sum, email, background
+            inv_id, amount, email, background
         )
         logger.info(
-            "Chat payment Result InvId=%s token=%s… email=%s mailed=%s",
+            "Chat payment CP Pay InvId=%s token=%s… email=%s mailed=%s",
             inv_id,
             token[:8],
             mail,
             mailed,
         )
     else:
-        logger.info("Course/other payment Result InvId=%s sum=%s", inv_id, out_sum)
+        logger.info("Course/other CP Pay InvId=%s sum=%s", inv_id, amount)
 
-    background.add_task(_forward_result_to_tilda, data)
-    return PlainTextResponse(f"OK{inv_id}")
+    background.add_task(_forward_form, settings.tilda_cp_pay_url, data, "Pay")
+    return JSONResponse({"code": 0})
+
+
+async def _success_from_existing(
+    request: Request,
+    inv_id: int,
+    amount_hint: str = "",
+) -> Any:
+    payment = await db.get_by_inv_id(inv_id)
+    if not payment:
+        return templates.TemplateResponse(
+            request,
+            "success.html",
+            {
+                "ok": False,
+                "error": (
+                    "Оплата ещё обрабатывается. Обновите страницу через несколько секунд "
+                    "или восстановите доступ по email."
+                ),
+                "telegram_url": None,
+                "email_note": None,
+                "auto_open_seconds": 0,
+            },
+        )
+
+    amount = payment["amount"] or amount_hint
+    if amount and not settings.is_chat_access_payment(amount):
+        return RedirectResponse(settings.course_success_url, status_code=303)
+
+    telegram_url = payment["telegram_url"] or (
+        f"https://t.me/{settings.bot_username}?start={payment['access_token']}"
+    )
+    mail = payment["email"]
+    mailed = bool(payment["email_sent_at"])
+    if mailed and mail:
+        email_note = f"Ссылку дублируем на почту {mail}."
+    elif mail and not email_configured(settings):
+        email_note = "Почта есть, но отправка писем ещё не настроена (нужен Brevo API)."
+    elif mail:
+        email_note = "Письмо могло не отправиться — сохраните кнопку/ссылку ниже."
+    else:
+        email_note = (
+            "Не нашли email с формы. Сохраните ссылку ниже или восстановите доступ по email."
+        )
+
+    return templates.TemplateResponse(
+        request,
+        "success.html",
+        {
+            "ok": True,
+            "error": "",
+            "telegram_url": telegram_url,
+            "email_note": email_note,
+            "auto_open_seconds": settings.auto_open_telegram_seconds,
+        },
+    )
 
 
 async def _handle_payment_success(request: Request, background: BackgroundTasks):
-    data = await _robokassa_payload(request)
+    data = await _form_payload(request)
 
+    # CloudPayments / ручной редирект: InvoiceId или TransactionId без подписи Robokassa
+    cp_inv = resolve_inv_id(data.get("InvoiceId"), data.get("TransactionId"))
+    if cp_inv is not None and not (data.get("OutSum") and data.get("SignatureValue")):
+        return await _success_from_existing(
+            request, cp_inv, normalize_amount(data.get("Amount") or "")
+        )
+
+    # Legacy Robokassa Success
     out_sum = data.get("OutSum", "")
     inv_id = data.get("InvId", "")
     signature = data.get("SignatureValue", "")
@@ -306,7 +410,7 @@ async def _handle_payment_success(request: Request, background: BackgroundTasks)
             },
         )
 
-    if not verify_success_signature(
+    if not settings.robokassa_configured or not verify_success_signature(
         out_sum, inv_id, signature, settings.robokassa_password1, data
     ):
         return templates.TemplateResponse(
@@ -333,7 +437,7 @@ async def _handle_payment_success(request: Request, background: BackgroundTasks)
     if mailed and mail:
         email_note = f"Ссылку дублируем на почту {mail}."
     elif mail and not email_configured(settings):
-        email_note = "Почта есть, но отправка писем ещё не настроена (нужен Brevo API на Render)."
+        email_note = "Почта есть, но отправка писем ещё не настроена (нужен Brevo API)."
     elif mail:
         email_note = "Письмо могло не отправиться — сохраните кнопку/ссылку ниже."
     else:
@@ -359,12 +463,15 @@ async def _handle_payment_success(request: Request, background: BackgroundTasks)
 async def root(request: Request, background: BackgroundTasks):
     if request.method == "HEAD":
         return PlainTextResponse("", status_code=200)
-    data = await _robokassa_payload(request)
+    data = await _form_payload(request)
     if data.get("OutSum") and data.get("InvId") and data.get("SignatureValue"):
         return await _handle_payment_success(request, background)
+    if resolve_inv_id(data.get("InvoiceId"), data.get("TransactionId")) is not None:
+        return await _handle_payment_success(request, background)
     return PlainTextResponse(
-        "Access bot OK. Success URL: "
-        f"{settings.public_base_url.rstrip('/')}/success"
+        "Access bot OK. "
+        f"CP Pay: {settings.public_base_url.rstrip('/')}/cloudpayments/pay ; "
+        f"Success: {settings.public_base_url.rstrip('/')}/success"
     )
 
 
@@ -426,6 +533,48 @@ async def recover_access(request: Request, email: str | None = Form(None)):
     )
 
 
+# --- Legacy Robokassa --------------------------------------------------------
+
+
+@app.api_route("/robokassa/result", methods=["GET", "POST"])
+async def robokassa_result(request: Request, background: BackgroundTasks) -> PlainTextResponse:
+    if not settings.robokassa_configured:
+        return PlainTextResponse("robokassa disabled", status_code=410)
+
+    data = await _form_payload(request)
+    out_sum = data.get("OutSum", "")
+    inv_id = data.get("InvId", "")
+    signature = data.get("SignatureValue", "")
+
+    if not out_sum or not inv_id or not signature:
+        return PlainTextResponse("bad request", status_code=400)
+
+    if not verify_result_signature(
+        out_sum, inv_id, signature, settings.robokassa_password2, data
+    ):
+        logger.warning("Invalid ResultURL signature for InvId=%s", inv_id)
+        return PlainTextResponse("bad sign", status_code=400)
+
+    email = await _resolve_chat_email(int(inv_id), data)
+
+    if settings.is_chat_access_payment(out_sum):
+        token, _telegram_url, mailed, mail = await _ensure_chat_access(
+            int(inv_id), out_sum, email, background
+        )
+        logger.info(
+            "Chat payment Result InvId=%s token=%s… email=%s mailed=%s",
+            inv_id,
+            token[:8],
+            mail,
+            mailed,
+        )
+    else:
+        logger.info("Course/other payment Result InvId=%s sum=%s", inv_id, out_sum)
+
+    background.add_task(_forward_form, settings.tilda_result_url, data, "RobokassaResult")
+    return PlainTextResponse(f"OK{inv_id}")
+
+
 @app.get("/dev/fake-paid")
 async def fake_paid(
     background: BackgroundTasks,
@@ -443,7 +592,7 @@ async def fake_paid(
 
 @app.get("/dev/pay-link")
 async def pay_link(inv_id: int = Query(..., ge=1)) -> dict[str, str]:
-    if settings.robokassa_is_test != 1:
+    if settings.robokassa_is_test != 1 or not settings.robokassa_configured:
         raise HTTPException(403, "Disabled outside test mode")
     out_sum = settings.access_price
     sign = payment_signature(

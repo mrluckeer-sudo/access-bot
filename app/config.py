@@ -21,15 +21,23 @@ class Settings(BaseSettings):
     public_base_url: str
     webhook_secret: str = "change_me"
 
-    robokassa_merchant_login: str
-    robokassa_password1: str
-    robokassa_password2: str
+    # CloudPayments (основной провайдер)
+    cloudpayments_public_id: str = ""
+    cloudpayments_api_secret: str = ""
+    # Прокси уведомлений на Tilda, чтобы курсы продолжали отмечаться
+    tilda_cp_pay_url: str = "https://forms.tildacdn.com/payment/cloudpayments/pay/"
+    tilda_cp_check_url: str = "https://forms.tildacdn.com/payment/cloudpayments/check/"
+
+    # Robokassa (legacy, опционально)
+    robokassa_merchant_login: str = ""
+    robokassa_password1: str = ""
+    robokassa_password2: str = ""
     robokassa_is_test: int = 1
+    tilda_result_url: str = "https://forms.tildacdn.com/payment/robokassa/"
 
     access_price: str = "990.00"
     course_success_url: str = "https://logopedvolgina.ru/success"
     course_fail_url: str = "https://logopedvolgina.ru/fail"
-    tilda_result_url: str = "https://forms.tildacdn.com/payment/robokassa/"
 
     database_path: str = "./data/bot.db"
 
@@ -79,8 +87,8 @@ class Settings(BaseSettings):
         "Оплата прошла успешно. Чтобы получить доступ в закрытый чат, "
         "перейдите по ссылке и нажмите Start у бота:\n\n"
         "{telegram_url}\n\n"
-        "Если кнопка «Вернуться в магазин» на Robokassa вас смутила — "
-        "этого письма достаточно, оплата уже учтена.\n\n"
+        "Если страница оплаты вас смутила — этого письма достаточно, "
+        "оплата уже учтена.\n\n"
         "С уважением,\nVolgina"
     )
     # Через сколько секунд автоматически открыть Telegram на success-странице (0 = выкл)
@@ -93,6 +101,18 @@ class Settings(BaseSettings):
 
     def is_chat_access_payment(self, out_sum: str) -> bool:
         return normalize_amount(out_sum) in self.access_prices
+
+    @property
+    def cloudpayments_configured(self) -> bool:
+        return bool(self.cloudpayments_api_secret)
+
+    @property
+    def robokassa_configured(self) -> bool:
+        return bool(
+            self.robokassa_merchant_login
+            and self.robokassa_password1
+            and self.robokassa_password2
+        )
 
     @property
     def webhook_path(self) -> str:

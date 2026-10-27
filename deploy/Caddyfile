@@ -1,0 +1,4 @@
+# Замените bot.example.ru на ваш домен (A-запись → IP ВМ в Yandex Cloud)
+bot.example.ru {
+	reverse_proxy app:8080
+}
