@@ -51,12 +51,23 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 async def lifespan(_app: FastAPI):
     await db.connect()
     setup_bot_handlers(dp, db, settings)
-    await bot.set_webhook(
-        url=settings.webhook_url,
-        drop_pending_updates=True,
-        allowed_updates=["message"],
-    )
-    logger.info("Webhook set: %s", settings.webhook_url)
+    try:
+        import asyncio
+
+        await asyncio.wait_for(
+            bot.set_webhook(
+                url=settings.webhook_url,
+                drop_pending_updates=True,
+                allowed_updates=["message"],
+            ),
+            timeout=15.0,
+        )
+        logger.info("Webhook set: %s", settings.webhook_url)
+    except Exception:
+        logger.exception(
+            "Telegram setWebhook failed (server still starts). "
+            "Check outbound access to api.telegram.org or set a proxy."
+        )
     yield
     await bot.session.close()
     await db.close()
