@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     telegram_chat_id: int
     public_base_url: str
     webhook_secret: str = "change_me"
+    # Прокси Bot API (Cloudflare Worker), без слэша в конце.
+    # Пример: https://telegram-api-proxy.xxx.workers.dev
+    telegram_api_base: str = ""
 
     # CloudPayments (основной провайдер)
     cloudpayments_public_id: str = ""

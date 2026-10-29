@@ -8,9 +8,7 @@ from typing import Any
 from urllib.parse import parse_qsl
 
 import httpx
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram import Dispatcher
 from aiogram.types import Update
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
@@ -31,16 +29,14 @@ from app.robokassa import (
     verify_result_signature,
     verify_success_signature,
 )
+from app.telegram_bot import create_bot
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
 db = Database(settings.database_path)
-bot = Bot(
-    token=settings.bot_token,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+bot = create_bot(settings)
 dp = Dispatcher()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -66,7 +62,7 @@ async def lifespan(_app: FastAPI):
     except Exception:
         logger.exception(
             "Telegram setWebhook failed (server still starts). "
-            "Check outbound access to api.telegram.org or set a proxy."
+            "Set TELEGRAM_API_BASE to Cloudflare Worker URL if api.telegram.org is blocked."
         )
     yield
     await bot.session.close()

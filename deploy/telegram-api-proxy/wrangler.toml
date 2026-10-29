@@ -1,0 +1,6 @@
+name = "telegram-api-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# Деплой: npx wrangler deploy
+# Или через Dashboard → Workers (см. deploy/yandex-cloud.md)
